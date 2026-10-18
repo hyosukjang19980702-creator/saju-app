@@ -1,5 +1,6 @@
 """AI 사주 서비스 (Streamlit).  실행: streamlit run app.py"""
 import json
+import logging
 import os
 from datetime import date, time
 
@@ -23,7 +24,7 @@ def _init_db():
 
 _init_db()
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"
 CATS = itp.CATEGORIES
 PAGES: dict = {}
 
@@ -196,6 +197,7 @@ def send_code(email: str, purpose: str):
         try:
             mailer.send_code(email, code, PURPOSE_LABEL[purpose], service_name())
         except Exception as e:
+            logging.getLogger("saju.mail").warning("verification mail failed: %s: %s", type(e).__name__, e)
             return "error", f"인증 메일 발송에 실패했습니다. 잠시 후 다시 시도해 주세요. ({type(e).__name__})"
         return "success", f"{email} 로 인증코드를 보냈습니다. 10분 안에 입력해 주세요. 메일이 안 보이면 스팸함도 확인해 주세요."
     if os.environ.get("ALLOW_DEV_CODE") == "1":  # 개발/테스트 전용: SMTP 없이 화면에 코드 표시
@@ -523,7 +525,7 @@ def admin_page():
                 mailer.send(me["email"], f"[{service_name()}] 테스트 메일", "이 메일이 보이면 이메일 발송 설정이 정상입니다.")
                 st.success(f"{me['email']} 로 테스트 메일을 보냈습니다. 스팸함도 확인해 보세요.")
             except Exception as e:
-                st.error(f"발송 실패: {type(e).__name__}: {e}")
+                st.error(f"발송 실패 — {mailer.explain(e)}")
         st.markdown("**관리자 비밀번호 변경**")
         with st.form("chpw"):
             npw = st.text_input("새 비밀번호 (8자 이상)", type="password")
@@ -550,12 +552,17 @@ if u:
 else:
     nav.append(PAGES["auth"])
 
-pg = st.navigation(nav)
+pg = st.navigation(nav, position="hidden")  # 기본 메뉴는 숨기고 아래에서 직접 구성
 
 with st.sidebar:
+    st.page_link(PAGES["home"], label="사주 보기", icon="🔮", width="stretch")
+    if not u:
+        st.page_link(PAGES["auth"], label="로그인 / 회원가입", icon="🔑", width="stretch")
+    elif u["role"] == "admin":
+        st.page_link(PAGES["admin"], label="관리자", icon="🛠️", width="stretch")
     if u:
         st.divider()
-        st.page_link(PAGES["my"], label=f"{u['name']}님", icon="👤", width="stretch")
+        st.page_link(PAGES["my"], label=f"{u['name']}님", icon="👤", width="stretch")  # 누르면 마이페이지
         if st.button("로그아웃", width="stretch"):
             st.session_state.pop("user", None)
             st.rerun()

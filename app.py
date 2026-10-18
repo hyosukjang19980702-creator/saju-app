@@ -8,12 +8,22 @@ import streamlit as st
 
 import db
 import interpret as itp
+import mailer
 import payments
 import saju_engine as se
 
 st.set_page_config(page_title="AI 사주", page_icon="🔮", layout="centered")
-db.init_db()
 
+
+@st.cache_resource
+def _init_db():
+    db.init_db()
+    return True
+
+
+_init_db()
+
+APP_VERSION = "0.4.0"
 CATS = itp.CATEGORIES
 PAGES: dict = {}
 
@@ -115,6 +125,9 @@ def category_block(ctx, cat):
 
 
 def home():
+    flash = st.session_state.pop("flash", None)
+    if flash:
+        st.success(flash)
     st.title(f"🔮 {service_name()}")
     st.caption("생년월일시로 보는 직업운 · 재물운 · 연애운 — 요약은 누구나 무료, 상세 풀이는 회원 전용")
 
@@ -169,10 +182,106 @@ def home():
     st.caption(itp.DISCLAIMER)
 
 
-# ---------- 로그인 / 회원가입 ----------
+# ---------- 로그인 / 회원가입 / 이메일 인증 ----------
+PURPOSE_LABEL = {"signup": "회원가입", "reset": "비밀번호 재설정"}
+
+
+def send_code(email: str, purpose: str):
+    """인증코드 발급·메일 발송. returns (알림레벨, 메시지)"""
+    try:
+        code = db.issue_code(email, purpose)
+    except ValueError as e:  # 60초 쿨다운: 이미 보낸 코드가 유효
+        return "warning", str(e)
+    if mailer.configured():
+        try:
+            mailer.send_code(email, code, PURPOSE_LABEL[purpose], service_name())
+        except Exception as e:
+            return "error", f"인증 메일 발송에 실패했습니다. 잠시 후 다시 시도해 주세요. ({type(e).__name__})"
+        return "success", f"{email} 로 인증코드를 보냈습니다. 10분 안에 입력해 주세요. 메일이 안 보이면 스팸함도 확인해 주세요."
+    if os.environ.get("ALLOW_DEV_CODE") == "1":  # 개발/테스트 전용: SMTP 없이 화면에 코드 표시
+        return "warning", f"[개발 모드] 인증코드: {code}"
+    return "error", "메일 발송 설정(SMTP)이 아직 되어 있지 않습니다. 운영자에게 문의해 주세요."
+
+
+def notice():
+    lvl, msg = st.session_state.pop("auth_notice", (None, None))
+    if msg:
+        getattr(st, lvl)(msg)
+
+
+def verify_panel(email: str):
+    st.title("📧 이메일 인증")
+    notice()
+    st.write(f"**{email}** 로 보낸 6자리 인증코드를 입력해 주세요.")
+    with st.form("verify"):
+        code = st.text_input("인증코드", max_chars=6)
+        ok = st.form_submit_button("인증하기", type="primary", width="stretch")
+    if ok:
+        good, err = db.verify_code(email, "signup", code)
+        if good:
+            db.mark_verified(email)
+            u = db.get_user_by_email(email)
+            db.log_event("signup", u["id"])
+            st.session_state.pop("verify_email", None)
+            st.session_state["user"] = u
+            st.switch_page(PAGES["home"])
+        else:
+            st.error(err)
+    c1, c2 = st.columns(2)
+    if c1.button("인증코드 다시 받기", width="stretch"):
+        st.session_state["auth_notice"] = send_code(email, "signup")
+        st.rerun()
+    if c2.button("처음으로", width="stretch"):
+        st.session_state.pop("verify_email", None)
+        st.rerun()
+
+
+def reset_tab():
+    email = st.session_state.get("reset_email")
+    if not email:
+        with st.form("reset_req"):
+            e = st.text_input("가입한 이메일")
+            ok = st.form_submit_button("인증코드 보내기", width="stretch")
+        if ok:
+            u = db.get_user_by_email(e) if e else None
+            if u:
+                st.session_state["auth_notice"] = send_code(u["email"], "reset")
+            else:  # 가입 여부를 노출하지 않기 위해 같은 문구 사용
+                st.session_state["auth_notice"] = ("success", "가입된 이메일이라면 인증코드를 보냈습니다.")
+            st.session_state["reset_email"] = e.strip().lower()
+            st.rerun()
+        return
+    notice()
+    with st.form("reset_do"):
+        code = st.text_input("인증코드", max_chars=6)
+        npw = st.text_input("새 비밀번호 (8자 이상)", type="password")
+        ok = st.form_submit_button("비밀번호 변경", type="primary", width="stretch")
+    if ok:
+        u = db.get_user_by_email(email)
+        good, err = db.verify_code(email, "reset", code) if u else (False, "인증코드가 일치하지 않습니다.")
+        if good:
+            try:
+                db.change_password(u["id"], npw)
+                db.mark_verified(email)  # 메일 수신을 확인했으므로 인증 완료로 처리
+                st.session_state.pop("reset_email", None)
+                st.success("비밀번호를 변경했습니다. '로그인' 탭에서 로그인해 주세요.")
+            except ValueError as e:
+                st.error(str(e))
+        else:
+            st.error(err)
+    if st.button("처음으로", key="reset_back"):
+        st.session_state.pop("reset_email", None)
+        st.rerun()
+
+
 def auth_page():
+    if st.session_state.get("verify_email"):
+        verify_panel(st.session_state["verify_email"])
+        return
+
     st.title("🔑 로그인 / 회원가입")
-    tab_in, tab_up = st.tabs(["로그인", "회원가입"])
+    notice()
+    tab_in, tab_up, tab_pw = st.tabs(["로그인", "회원가입", "비밀번호 찾기"])
 
     with tab_in:
         with st.form("login"):
@@ -184,14 +293,20 @@ def auth_page():
             if fails >= 5:
                 st.error("로그인 시도가 너무 많습니다. 잠시 후 다시 시도해 주세요.")
             else:
-                u = db.authenticate(email, pw)
-                if u:
+                status, u = db.login(email, pw)
+                if status == "ok":
                     st.session_state["user"] = u
                     st.session_state["fails"] = 0
                     st.switch_page(PAGES["home"])
+                elif status == "unverified":  # 가입은 했지만 메일 인증을 끝내지 않음
+                    st.session_state["verify_email"] = u["email"]
+                    st.session_state["auth_notice"] = send_code(u["email"], "signup")
+                    st.rerun()
+                elif status == "inactive":
+                    st.error("비활성화된 계정입니다. 운영자에게 문의해 주세요.")
                 else:
                     st.session_state["fails"] = fails + 1
-                    st.error("이메일 또는 비밀번호가 올바르지 않거나 비활성화된 계정입니다.")
+                    st.error("이메일 또는 비밀번호가 올바르지 않습니다.")
 
     with tab_up:
         with st.form("signup"):
@@ -200,7 +315,7 @@ def auth_page():
             pw = st.text_input("비밀번호 (8자 이상)", type="password", key="su_pw")
             pw2 = st.text_input("비밀번호 확인", type="password", key="su_pw2")
             agree = st.checkbox("이용약관 및 개인정보 수집·이용에 동의합니다. (필수)")
-            ok = st.form_submit_button("가입하기", type="primary", width="stretch")
+            ok = st.form_submit_button("인증코드 받고 가입하기", type="primary", width="stretch")
         if ok:
             if not agree:
                 st.error("필수 약관에 동의해 주세요.")
@@ -209,29 +324,92 @@ def auth_page():
             else:
                 try:
                     u = db.create_user(email, name, pw)
-                    db.log_event("signup", u["id"])
-                    st.session_state["user"] = u
-                    st.switch_page(PAGES["home"])
+                except ValueError as e:
+                    st.error(str(e))
+                else:
+                    st.session_state["verify_email"] = u["email"]
+                    st.session_state["auth_notice"] = send_code(u["email"], "signup")
+                    st.rerun()
+
+    with tab_pw:
+        reset_tab()
+
+
+# ---------- 마이페이지 ----------
+def mypage():
+    u = user()
+    st.title("👤 마이페이지")
+    t_orders, t_id, t_pw, t_out = st.tabs(["구매내역", "아이디", "비밀번호", "회원탈퇴"])
+
+    with t_orders:
+        orders = db.user_orders(u["id"])
+        if not orders:
+            st.info("아직 구매한 풀이가 없어요. 사주 보기에서 시작해 보세요.")
+        for o in orders:
+            icon, label = CATS.get(o["category"], ("", o["category"]))
+            badge = "" if o["status"] == "paid" else " (환불됨)"
+            with st.expander(f"{icon} {label} · {o['birth_summary']} · {won(o['amount'])} · {o['created_at']}{badge}"):
+                if o["status"] == "paid":
+                    st.markdown(o["content"])
+                else:
+                    st.caption("환불 처리된 주문입니다.")
+
+    with t_id:
+        st.markdown("**아이디(로그인 이메일)**")
+        st.code(u["email"], language=None)
+        st.caption("아이디는 가입한 이메일 주소이며 이 화면에서 변경할 수 없어요.")
+        with st.form("rename"):
+            new_name = st.text_input("이름(닉네임)", value=u["name"], max_chars=20)
+            if st.form_submit_button("이름 변경", width="stretch"):
+                try:
+                    db.update_name(u["id"], new_name)
+                    st.session_state["user"]["name"] = new_name.strip()[:20]
+                    st.success("이름을 변경했습니다.")
+                    st.rerun()
                 except ValueError as e:
                     st.error(str(e))
 
-
-# ---------- 내 구매내역 ----------
-def mypage():
-    u = user()
-    st.title("🧾 내 구매내역")
-    st.caption(f"{u['name']} · {u['email']}")
-    orders = db.user_orders(u["id"])
-    if not orders:
-        st.info("아직 구매한 풀이가 없어요. 사주 보기에서 시작해 보세요.")
-    for o in orders:
-        icon, label = CATS.get(o["category"], ("", o["category"]))
-        badge = "" if o["status"] == "paid" else " (환불됨)"
-        with st.expander(f"{icon} {label} · {o['birth_summary']} · {won(o['amount'])} · {o['created_at']}{badge}"):
-            if o["status"] == "paid":
-                st.markdown(o["content"])
+    with t_pw:
+        with st.form("chpw_user"):
+            old = st.text_input("현재 비밀번호", type="password")
+            new = st.text_input("새 비밀번호 (8자 이상)", type="password")
+            new2 = st.text_input("새 비밀번호 확인", type="password")
+            ok = st.form_submit_button("비밀번호 변경", type="primary", width="stretch")
+        if ok:
+            if new != new2:
+                st.error("새 비밀번호 확인이 일치하지 않습니다.")
             else:
-                st.caption("환불 처리된 주문입니다.")
+                try:
+                    db.change_password_checked(u["id"], old, new)
+                    st.success("비밀번호를 변경했습니다.")
+                except ValueError as e:
+                    st.error(str(e))
+
+    with t_out:
+        if u["role"] == "admin":
+            st.info("관리자 계정은 이 화면에서 탈퇴할 수 없습니다.")
+        else:
+            st.warning(
+                "탈퇴하면 이메일·이름·입력하신 생년월일 정보와 **구매한 풀이 내용이 삭제되어 다시 볼 수 없습니다.** "
+                "결제 기록(금액·일시·거래번호)은 관련 법령상 보관이 필요할 수 있어 개인정보를 제외하고 남습니다."
+            )
+            with st.form("withdraw"):
+                pw = st.text_input("비밀번호 확인", type="password")
+                agree = st.checkbox("위 내용을 확인했으며 탈퇴에 동의합니다.")
+                ok = st.form_submit_button("탈퇴하기", type="primary", width="stretch")
+            if ok:
+                if not agree:
+                    st.error("탈퇴 동의에 체크해 주세요.")
+                else:
+                    try:
+                        db.withdraw_user(u["id"], pw)
+                    except ValueError as e:
+                        st.error(str(e))
+                    else:
+                        for k in ("user", "ctx", "verify_email", "reset_email"):
+                            st.session_state.pop(k, None)
+                        st.session_state["flash"] = "회원 탈퇴가 완료되었습니다. 이용해 주셔서 감사합니다."
+                        st.switch_page(PAGES["home"])
 
 
 # ---------- 관리자 ----------
@@ -241,6 +419,11 @@ def admin_page():
         st.error("관리자만 접근할 수 있습니다.")
         return
     st.title("🛠️ 관리자")
+    if not db.is_pg():
+        st.warning("현재 임시 파일 DB(SQLite)를 사용 중입니다. 클라우드에서는 앱이 재시작되면 회원·주문 데이터가 사라질 수 있어요. "
+                   "Secrets에 DATABASE_URL을 설정하세요. (내 컴퓨터 테스트 중이라면 무시해도 됩니다.)")
+    if not mailer.configured():
+        st.warning("이메일 발송(SMTP)이 설정되지 않아 인증코드를 보낼 수 없습니다. Secrets에 SMTP_* 값을 설정하세요.")
     if db.authenticate(*db.DEFAULT_ADMIN):
         st.warning("기본 관리자 비밀번호를 사용 중입니다. '설정' 탭에서 즉시 변경하세요.")
 
@@ -254,7 +437,7 @@ def admin_page():
         total = int(paid["amount"].sum()) if len(paid) else 0
         today_rev = int(paid[paid["created_at"].str.startswith(today)]["amount"].sum()) if len(paid) else 0
         buyers = paid["email"].nunique() if len(paid) else 0
-        members = int((users["role"] == "user").sum())
+        members = int(((users["role"] == "user") & (users["email_verified"] == 1)).sum())
         c = st.columns(4)
         c[0].metric("누적 매출", won(total))
         c[1].metric("오늘 매출", won(today_rev))
@@ -296,13 +479,23 @@ def admin_page():
         st.dataframe(users, width="stretch", hide_index=True)
         if len(users):
             st.download_button("회원 CSV 다운로드", users.to_csv(index=False).encode("utf-8-sig"), "users.csv", "text/csv")
-            targets = users[users["role"] == "user"]
-            if len(targets):
-                uid = st.selectbox("회원 선택", targets["id"].tolist(),
-                                   format_func=lambda i: f"#{i} {targets[targets['id'] == i].iloc[0]['email']}")
-                active = bool(targets[targets["id"] == uid].iloc[0]["is_active"])
-                if st.button("비활성화" if active else "활성화"):
-                    db.set_user_active(int(uid), not active)
+            st.markdown("**회원 관리**")
+            others = users[users["id"] != me["id"]]
+            if len(others):
+                uid = st.selectbox(
+                    "회원 선택", others["id"].tolist(),
+                    format_func=lambda i: "#{} {} ({})".format(i, others[others["id"] == i].iloc[0]["email"],
+                                                              others[others["id"] == i].iloc[0]["role"]))
+                row = others[others["id"] == uid].iloc[0]
+                c = st.columns(3)
+                if c[0].button("비활성화" if row["is_active"] else "활성화", width="stretch"):
+                    db.set_user_active(int(uid), not bool(row["is_active"]))
+                    st.rerun()
+                if not row["email_verified"] and c[1].button("이메일 인증 처리", width="stretch"):
+                    db.set_email_verified(int(uid), True)
+                    st.rerun()
+                if c[2].button("관리자 해제" if row["role"] == "admin" else "관리자로 지정", width="stretch"):
+                    db.set_user_role(int(uid), "user" if row["role"] == "admin" else "admin")
                     st.rerun()
 
     with t_set:
@@ -320,6 +513,17 @@ def admin_page():
                 db.set_setting("enabled_cats", json.dumps(cats_on))
                 db.set_setting("use_llm", "1" if (llm and has_key) else "0")
                 st.success("저장했습니다.")
+        st.markdown("**시스템 상태**")
+        st.write(f"- 데이터 저장소: {db.backend_label()}")
+        st.write(f"- 이메일 발송(SMTP): {'✅ 설정됨' if mailer.configured() else '❌ 미설정'}")
+        st.write(f"- LLM 키(ANTHROPIC_API_KEY): {'✅ 설정됨' if os.environ.get('ANTHROPIC_API_KEY') else '미설정'}")
+        st.write(f"- 앱 버전: {APP_VERSION}")
+        if st.button("내 이메일로 테스트 메일 보내기", disabled=not mailer.configured()):
+            try:
+                mailer.send(me["email"], f"[{service_name()}] 테스트 메일", "이 메일이 보이면 이메일 발송 설정이 정상입니다.")
+                st.success(f"{me['email']} 로 테스트 메일을 보냈습니다. 스팸함도 확인해 보세요.")
+            except Exception as e:
+                st.error(f"발송 실패: {type(e).__name__}: {e}")
         st.markdown("**관리자 비밀번호 변경**")
         with st.form("chpw"):
             npw = st.text_input("새 비밀번호 (8자 이상)", type="password")
@@ -334,7 +538,7 @@ def admin_page():
 # ---------- 내비게이션 ----------
 PAGES["home"] = st.Page(home, title="사주 보기", icon="🔮", url_path="home", default=True)
 PAGES["auth"] = st.Page(auth_page, title="로그인 / 회원가입", icon="🔑", url_path="auth")
-PAGES["my"] = st.Page(mypage, title="내 구매내역", icon="🧾", url_path="my")
+PAGES["my"] = st.Page(mypage, title="마이페이지", icon="👤", url_path="my")
 PAGES["admin"] = st.Page(admin_page, title="관리자", icon="🛠️", url_path="admin")
 
 u = user()
@@ -346,11 +550,15 @@ if u:
 else:
     nav.append(PAGES["auth"])
 
+pg = st.navigation(nav)
+
 with st.sidebar:
     if u:
-        st.write(f"👤 **{u['name']}**님")
-        if st.button("로그아웃"):
+        st.divider()
+        st.page_link(PAGES["my"], label=f"{u['name']}님", icon="👤", width="stretch")
+        if st.button("로그아웃", width="stretch"):
             st.session_state.pop("user", None)
             st.rerun()
+    st.caption(f"v{APP_VERSION}")
 
-st.navigation(nav).run()
+pg.run()

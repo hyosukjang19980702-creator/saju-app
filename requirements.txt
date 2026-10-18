@@ -2,3 +2,5 @@ streamlit>=1.50
 lunar_python>=1.3
 pandas
 requests
+sqlalchemy>=2.0
+psycopg2-binary

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import hmac
 import os
 import re
@@ -114,6 +115,8 @@ def init_db():
         execute("ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 1")
     if "deleted_at" not in cols:
         execute("ALTER TABLE users ADD COLUMN deleted_at TEXT")
+    if "profile" not in cols:
+        execute("ALTER TABLE users ADD COLUMN profile TEXT")
     ocols = [c["name"] for c in inspect(engine()).get_columns("orders")]
     for col in ("order_no", "payload", "token_hash", "view_hash"):
         if col not in ocols:
@@ -250,6 +253,19 @@ def update_name(uid: int, name: str):
     execute("UPDATE users SET name=:n WHERE id=:i", n=name[:20], i=uid)
 
 
+def get_profile(uid: int) -> dict | None:
+    """회원이 '내 정보'에 저장한 이름·생년월일 등. 없으면 None."""
+    r = query_one("SELECT profile FROM users WHERE id=:i", i=uid)
+    try:
+        return json.loads(r["profile"]) if r and r.get("profile") else None
+    except Exception:
+        return None
+
+
+def set_profile(uid: int, profile: dict):
+    execute("UPDATE users SET profile=:p WHERE id=:i", p=json.dumps(profile, ensure_ascii=False), i=uid)
+
+
 def change_password_checked(uid: int, old_pw: str, new_pw: str):
     u = query_one("SELECT * FROM users WHERE id=:i", i=uid)
     if not u or not hmac.compare_digest(_hash(old_pw, u["salt"]), u["pw_hash"]):
@@ -272,7 +288,7 @@ def withdraw_user(uid: int, pw: str):
     execute("UPDATE orders SET birth_summary=NULL, content=NULL, payload=NULL, token_hash=NULL WHERE user_id=:i", i=uid)
     execute("UPDATE events SET user_id=NULL WHERE user_id=:i", i=uid)
     execute(
-        "UPDATE users SET email=:a, name='탈퇴회원', pw_hash=:h, salt=:s, is_active=0, email_verified=0, deleted_at=:t WHERE id=:i",
+        "UPDATE users SET email=:a, name='탈퇴회원', pw_hash=:h, salt=:s, is_active=0, email_verified=0, profile=NULL, deleted_at=:t WHERE id=:i",
         a=f"deleted-{uid}@deleted.invalid", h=secrets.token_hex(32), s=salt, t=now(), i=uid,
     )
     log_event("withdraw")

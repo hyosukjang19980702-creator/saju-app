@@ -8,9 +8,9 @@ import requests
 
 CATEGORIES = {
     "love": ("🌸", "연애운"),
+    "commute": ("🏯", "출근길 운세"),
     "wealth": ("💰", "재물운"),
     "career": ("📜", "취업운"),
-    "commute": ("🏯", "출근길 운세"),
 }
 
 LOCKED_TITLES = ["타고난 성향과 사주 강약", "상세 풀이", "올해의 흐름", "주의할 점", "실천 조언", "오행 보완 팁"]

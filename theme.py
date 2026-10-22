@@ -5,7 +5,12 @@ CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+KR:wght@400;600;700&display=swap');
 :root{--gold:#a8742a;--gold2:#7a4f12;--paper:#fffaf0;--text:#2b2118;--muted:#6f6149;--line:rgba(139,100,40,.28)}
 html, body, [class*="css"], .stApp, .stMarkdown, button, input, textarea, label{font-family:'Noto Serif KR','Nanum Myeongjo',serif !important}
-.stApp{background:linear-gradient(180deg,#fdf8ec 0%,#f7eed9 100%);color:var(--text)}
+:root{color-scheme:light}
+.stApp{background:repeating-linear-gradient(0deg,rgba(150,115,60,.035) 0 1px,transparent 1px 7px),linear-gradient(180deg,#fdf8ec 0%,#f6ebd2 100%);color:var(--text)}
+.stApp [data-testid="stMarkdownContainer"] p,.stApp [data-testid="stMarkdownContainer"] li,.stApp label p,.stApp [data-testid="stCaptionContainer"]{color:#2b2118}
+.stApp [data-testid="stCaptionContainer"]{color:#6f6149}
+[data-testid="stAppViewContainer"]::before{content:"";display:block;height:8px;background:linear-gradient(90deg,#8c2f23 0 20%,#2f6b5a 20% 40%,#c9a24a 40% 60%,#2f5d8c 60% 80%,#8c2f23 80%)}
+.price{background:#fbe9e4 !important;border-color:#a63a2a !important;color:#8c2f23 !important}
 [data-testid="stHeader"]{background:transparent}
 [data-testid="stSidebar"]{background:#f1e5c8;border-right:1px solid var(--line)}
 h1,h2,h3,h4{color:var(--gold2) !important}
@@ -59,7 +64,7 @@ EMBLEM = ('<svg width="52" height="52" viewBox="0 0 64 64" xmlns="http://www.w3.
 
 def hero_html(service: str) -> str:
     return (f'<div class="hero"><div class="moon"></div>{ROOF}'
-            f'<div class="brand">{EMBLEM}<div><div class="t">{service}</div><div class="s">조선의 하늘을 잇는, 당신의 운명</div></div></div>'
+            f'<div class="brand">{EMBLEM}<div><div class="t">{service}</div><div class="s">조선 명리학으로 풀어내는 당신의 운명</div></div></div>'
             '<div class="copy"><div class="kick">조선시대 천문학과 고서에서 찾은</div>'
             '<div class="big">AI가 풀어낸<br><em>당신의 사주</em></div>'
             '<div class="sub">천문과 고전의 지혜에,<br>AI의 정밀한 해석을 더한<br>프리미엄 운세 서비스</div>'

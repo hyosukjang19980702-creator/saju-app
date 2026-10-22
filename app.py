@@ -30,7 +30,7 @@ def _init_db():
 
 _init_db()
 
-APP_VERSION = "0.6.1"
+APP_VERSION = "0.6.3"
 CATS = itp.CATEGORIES
 PAGES: dict = {}
 
@@ -69,7 +69,7 @@ def doc_text(dk: str, default: str) -> str:
 
 def enabled_cats() -> list:
     try:
-        keys = json.loads(db.get_setting("enabled_cats_v2", json.dumps(list(CATS))))
+        keys = json.loads(db.get_setting("enabled_cats_v3", json.dumps(list(CATS))))
     except Exception:
         keys = list(CATS)
     return [k for k in CATS if k in keys]
@@ -278,6 +278,23 @@ def handle_payment_return():
 
 
 # ---------- 홈 ----------
+def build_ctx(p: dict) -> dict:
+    """입력(또는 저장된 내 정보)으로 사주 계산 결과(ctx)를 만듭니다."""
+    hour, minute = (None, 0) if p["unknown"] else (p["hh"], p["mm"])
+    chart = se.compute_chart(p["y"], p["m"], p["d"], hour, minute, p["gender"], p["cal"], p["leap"], p["adj"])
+    return {
+        "chart": chart, "name": p["name"].strip(),
+        "key": se.chart_key(p["y"], p["m"], p["d"], hour, minute, p["gender"], p["cal"], p["leap"], p["adj"]),
+        "summary": f"{p['y']}-{p['m']:02d}-{p['d']:02d} " + ("시간미상" if p["unknown"] else f"{p['hh']:02d}:{p['mm']:02d}") + f" {p['cal']} {p['gender']}",
+        "params": {"y": p["y"], "m": p["m"], "d": p["d"], "hour": hour, "minute": minute,
+                   "gender": p["gender"], "calendar": p["cal"], "leap": p["leap"], "adj": p["adj"]},
+    }
+
+
+def reset_ctx():
+    st.session_state.pop("ctx", None)  # 다른 운세로 갈 때 입력 정보 초기화(회원은 내 정보에서 자동 적용)
+
+
 def pick_cards():
     st.markdown('<div id="pick"></div>', unsafe_allow_html=True)
     st.subheader("어떤 운을 보고 싶으신가요?")
@@ -294,6 +311,7 @@ def pick_cards():
                     + f'<div class="ptag">{p["tagline"]}</div><span class="price">{won(price_for(cat))}</span> <span class="ptitle">요약 무료</span>',
                     unsafe_allow_html=True)
                 if st.button("이분께 묻기  →", key=f"pick_{cat}", type="primary", width="stretch"):
+                    reset_ctx()
                     st.session_state["cat_sel"] = cat
                     st.rerun()
 
@@ -337,6 +355,7 @@ def home():
         return
 
     if st.button("← 다른 운세 고르기", key="back_main"):
+        reset_ctx()
         st.session_state["cat_sel"] = None
         st.rerun()
     p = ch.PERSONAS[sel]
@@ -345,39 +364,49 @@ def home():
     c2.markdown(f'<div class="pname" style="margin-top:0">{p["name"]}</div><div class="ptitle">{p["title"]}</div>'
                 f'<div class="ptag">{p["tagline"]}</div>', unsafe_allow_html=True)
 
+    me = user()
+    prof = db.get_profile(me["id"]) if me and me.get("role") != "guest" else None
     ctx = st.session_state.get("ctx")
-    with st.expander("생년월일 입력" if not ctx else "생년월일 다시 입력", expanded=not ctx):
-        with st.form("birth"):
-            name = st.text_input("이름 (선택)", max_chars=20)
-            c1, c2 = st.columns(2)
-            gender = c1.radio("성별", ["여성", "남성"], horizontal=True)
-            cal = c2.radio("달력", ["양력", "음력"], horizontal=True)
-            bd = st.date_input("생년월일", value=date(1995, 1, 1), min_value=date(1920, 1, 1),
-                               max_value=date.today(), format="YYYY/MM/DD")
-            leap = st.checkbox("음력 윤달")
-            unknown = st.checkbox("태어난 시간을 몰라요")
-            bt = st.time_input("태어난 시간", value=time(12, 0), step=60)
-            adj = st.checkbox("진태양시 보정 (-30분)")
-            go = st.form_submit_button("내 사주 보기", type="primary", width="stretch")
-
-    if go:
-        hour, minute = (None, 0) if unknown else (bt.hour, bt.minute)
+    if prof:  # 회원: 내 정보를 자동 적용
         try:
-            chart = se.compute_chart(bd.year, bd.month, bd.day, hour, minute, gender, cal, leap, adj)
+            if not ctx or ctx.get("from_profile") != prof:
+                ctx = build_ctx(prof)
+                ctx["from_profile"] = prof
+                st.session_state["ctx"] = ctx
         except Exception:
-            st.error("입력하신 날짜를 확인할 수 없어요. (음력 윤달/날짜를 다시 확인해 주세요)")
-            chart = None
-        if chart:
-            tstr = "시간미상" if unknown else f"{bt.hour:02d}:{bt.minute:02d}"
-            ctx = st.session_state["ctx"] = {
-                "chart": chart, "name": name.strip(),
-                "key": se.chart_key(bd.year, bd.month, bd.day, hour, minute, gender, cal, leap, adj),
-                "summary": f"{bd.isoformat()} {tstr} {cal} {gender}",
-                "params": {"y": bd.year, "m": bd.month, "d": bd.day, "hour": hour, "minute": minute,
-                           "gender": gender, "calendar": cal, "leap": leap, "adj": adj},
-            }
-            db.log_event("chart", (user() or {}).get("id"))
-            st.rerun()
+            ctx = None
+            st.warning("저장된 내 정보로 사주를 계산하지 못했어요. 마이페이지 → 내 정보에서 확인해 주세요.")
+        if ctx:
+            st.caption(f"📋 '내 정보'에 저장된 **{prof['name']}**님의 정보로 풀이합니다. 바꾸려면 마이페이지 → 내 정보에서 수정하세요.")
+    else:
+        if me:
+            st.info("마이페이지 → **내 정보**에 이름과 생년월일을 저장해 두면 모든 운세에 자동으로 적용돼요.")
+        with st.expander("생년월일 입력" if not ctx else "생년월일 다시 입력", expanded=not ctx):
+            with st.form("birth"):
+                name = st.text_input("이름 (필수)", max_chars=20)
+                c1, c2 = st.columns(2)
+                gender = c1.radio("성별", ["여성", "남성"], horizontal=True)
+                cal = c2.radio("달력", ["양력", "음력"], horizontal=True)
+                bd = st.date_input("생년월일", value=date(1995, 1, 1), min_value=date(1920, 1, 1),
+                                   max_value=date.today(), format="YYYY/MM/DD")
+                leap = st.checkbox("음력 윤달")
+                unknown = st.checkbox("태어난 시간을 몰라요")
+                bt = st.time_input("태어난 시간", value=time(12, 0), step=60)
+                adj = st.checkbox("진태양시 보정 (-30분)")
+                go = st.form_submit_button("내 사주 보기", type="primary", width="stretch")
+        if go and not name.strip():
+            st.error("이름을 입력해 주세요. 풀이에서 이름을 불러 드려요.")
+        elif go:
+            try:
+                ctx = build_ctx({"name": name, "gender": gender, "cal": cal, "leap": leap, "unknown": unknown,
+                                 "y": bd.year, "m": bd.month, "d": bd.day, "hh": bt.hour, "mm": bt.minute, "adj": adj})
+            except Exception:
+                st.error("입력하신 날짜를 확인할 수 없어요. (음력 윤달/날짜를 다시 확인해 주세요)")
+                ctx = None
+            if ctx:
+                st.session_state["ctx"] = ctx
+                db.log_event("chart", (user() or {}).get("id"))
+                st.rerun()
 
     if not ctx:
         st.caption(itp.DISCLAIMER)
@@ -553,7 +582,36 @@ def mypage():
     u = user()
     st.title("👤 마이페이지")
     show_flash()
-    t_orders, t_id, t_pw, t_out = st.tabs(["구매내역", "아이디", "비밀번호", "회원탈퇴"])
+    t_info, t_orders, t_id, t_pw, t_out = st.tabs(["내 정보", "구매내역", "아이디", "비밀번호", "회원탈퇴"])
+
+    with t_info:
+        st.caption("이름과 생년월일을 저장해 두면 모든 운세에 자동으로 적용돼요. (본인 정보는 풀이에만 쓰입니다)")
+        pf = db.get_profile(u["id"]) or {}
+        with st.form("profile_form"):
+            p_name = st.text_input("이름", value=pf.get("name", ""), max_chars=20)
+            c1, c2 = st.columns(2)
+            p_gender = c1.radio("성별", ["여성", "남성"], index=["여성", "남성"].index(pf.get("gender", "여성")), horizontal=True)
+            p_cal = c2.radio("달력", ["양력", "음력"], index=["양력", "음력"].index(pf.get("cal", "양력")), horizontal=True)
+            p_bd = st.date_input("생년월일", value=date(pf.get("y", 1995), pf.get("m", 1), pf.get("d", 1)),
+                                 min_value=date(1920, 1, 1), max_value=date.today(), format="YYYY/MM/DD")
+            p_leap = st.checkbox("음력 윤달", value=pf.get("leap", False))
+            p_unknown = st.checkbox("태어난 시간을 몰라요", value=pf.get("unknown", False))
+            p_bt = st.time_input("태어난 시간", value=time(pf.get("hh", 12), pf.get("mm", 0)), step=60)
+            p_adj = st.checkbox("진태양시 보정 (-30분)", value=pf.get("adj", False))
+            saved = st.form_submit_button("저장", type="primary", width="stretch")
+        if saved:
+            newp = {"name": p_name.strip(), "gender": p_gender, "cal": p_cal, "leap": p_leap, "unknown": p_unknown,
+                    "y": p_bd.year, "m": p_bd.month, "d": p_bd.day, "hh": p_bt.hour, "mm": p_bt.minute, "adj": p_adj}
+            if not newp["name"]:
+                st.error("이름을 입력해 주세요.")
+            else:
+                try:
+                    build_ctx(newp)  # 날짜 확인
+                    db.set_profile(u["id"], newp)
+                    st.session_state.pop("ctx", None)
+                    st.success("저장했어요. 이제 각 운세에 자동으로 적용됩니다.")
+                except Exception:
+                    st.error("입력하신 날짜를 확인할 수 없어요. (음력 윤달/날짜를 다시 확인해 주세요)")
 
     with t_orders:
         orders = [o for o in db.user_orders(u["id"]) if o["status"] in ("paid", "refunded")]
@@ -731,7 +789,7 @@ def admin_page():
                 for c, v in new_prices.items():
                     db.set_setting(f"price_{c}", str(int(v)))
                 db.set_setting("service_name", new_name.strip() or "AI 사주")
-                db.set_setting("enabled_cats_v2", json.dumps(cats_on))
+                db.set_setting("enabled_cats_v3", json.dumps(cats_on))
                 db.set_setting("use_llm", "1" if (llm and has_key) else "0")
                 st.success("저장했습니다.")
         st.markdown("**사업자 정보** (결제사 심사·전자상거래법상 사이트 하단에 표시)")
@@ -825,6 +883,7 @@ if u and st.session_state.pop("goto_my", False):
 
 with st.sidebar:
     if st.button("🔮 사주 보기", key="side_home", width="stretch"):
+        reset_ctx()
         st.session_state["cat_sel"] = None  # 운세 선택 화면(메인)으로
         st.switch_page(PAGES["home"])
     if not u:
@@ -836,6 +895,7 @@ with st.sidebar:
         st.page_link(PAGES["my"], label=f"{u['name']}님", icon="👤", width="stretch")  # 누르면 마이페이지
         if st.button("로그아웃", width="stretch"):
             st.session_state.pop("user", None)
+            reset_ctx()
             st.rerun()
     st.caption(f"v{APP_VERSION}")
 

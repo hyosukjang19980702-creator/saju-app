@@ -253,8 +253,23 @@ def update_name(uid: int, name: str):
     execute("UPDATE users SET name=:n WHERE id=:i", n=name[:20], i=uid)
 
 
+_profile_col_ok = False
+
+
+def _ensure_profile_col():
+    """앱이 재시작 없이 업데이트되어 마이그레이션이 안 돈 경우를 대비해, 처음 쓸 때 컬럼을 확인·추가합니다."""
+    global _profile_col_ok
+    if _profile_col_ok:
+        return
+    cols = [c["name"] for c in inspect(engine()).get_columns("users")]
+    if "profile" not in cols:
+        execute("ALTER TABLE users ADD COLUMN profile TEXT")
+    _profile_col_ok = True
+
+
 def get_profile(uid: int) -> dict | None:
     """회원이 '내 정보'에 저장한 이름·생년월일 등. 없으면 None."""
+    _ensure_profile_col()
     r = query_one("SELECT profile FROM users WHERE id=:i", i=uid)
     try:
         return json.loads(r["profile"]) if r and r.get("profile") else None
@@ -263,6 +278,7 @@ def get_profile(uid: int) -> dict | None:
 
 
 def set_profile(uid: int, profile: dict):
+    _ensure_profile_col()
     execute("UPDATE users SET profile=:p WHERE id=:i", p=json.dumps(profile, ensure_ascii=False), i=uid)
 
 

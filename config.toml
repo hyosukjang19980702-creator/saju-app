@@ -1,0 +1,18 @@
+[theme]
+base = "dark"
+primaryColor = "#d4b779"
+backgroundColor = "#0b0907"
+secondaryBackgroundColor = "#15110d"
+textColor = "#efe6d2"
+font = "serif"
+
+[client]
+# 일반 방문자에게 Streamlit 기본 메뉴(⋮) 등을 숨깁니다.
+toolbarMode = "minimal"
+
+[server]
+# 결제창 페이지(static/checkout.html)를 앱 주소 아래에서 제공하기 위해 필요합니다.
+enableStaticServing = true
+
+[browser]
+gatherUsageStats = false

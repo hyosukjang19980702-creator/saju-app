@@ -9,13 +9,17 @@ import pandas as pd
 import streamlit as st
 
 import db
+import characters as ch
+import fortune
 import interpret as itp
 import legal
 import mailer
 import payments
 import saju_engine as se
+import theme
 
-st.set_page_config(page_title="AI 사주", page_icon="🔮", layout="centered")
+st.set_page_config(page_title="천상운명", page_icon="🌙", layout="centered")
+st.markdown(theme.CSS, unsafe_allow_html=True)
 
 
 @st.cache_resource
@@ -26,7 +30,7 @@ def _init_db():
 
 _init_db()
 
-APP_VERSION = "0.5.1"
+APP_VERSION = "0.6.0"
 CATS = itp.CATEGORIES
 PAGES: dict = {}
 
@@ -40,12 +44,17 @@ def won(n) -> str:
     return f"{int(n):,}원"
 
 
-def price() -> int:
-    return int(db.get_setting("price", "3900"))
+def price_for(cat: str) -> int:
+    default = fortune.DEFAULT_PRICES.get(cat, 2900)
+    try:
+        return int(db.get_setting(f"price_{cat}", str(default)))
+    except ValueError:
+        return default
 
 
 def service_name() -> str:
-    return db.get_setting("service_name", "AI 사주")
+    name = db.get_setting("service_name", "천상운명")
+    return "천상운명" if name in ("", "AI 사주") else name
 
 
 def biz(key: str) -> str:
@@ -60,7 +69,7 @@ def doc_text(dk: str, default: str) -> str:
 
 def enabled_cats() -> list:
     try:
-        keys = json.loads(db.get_setting("enabled_cats", json.dumps(list(CATS))))
+        keys = json.loads(db.get_setting("enabled_cats_v2", json.dumps(list(CATS))))
     except Exception:
         keys = list(CATS)
     return [k for k in CATS if k in keys]
@@ -80,6 +89,15 @@ def pillar_html(label, p) -> str:
         f"<div style='font-size:11px;opacity:.7'>{p['br_ko']}({p['br_el_ko']})</div>"
         f"<div style='font-size:12px'>{p['br_tg']}</div></div>"
     )
+
+
+def render_content(cat: str, content: str):
+    """저장된 풀이를 대화(말풍선) 형식으로, 예전 형식이면 일반 글로 표시."""
+    msgs = fortune.content_to_msgs(content)
+    if msgs and cat in ch.PERSONAS:
+        st.markdown(fortune.bubbles_html(cat, msgs), unsafe_allow_html=True)
+    else:
+        st.markdown(content or "")
 
 
 # ---------- 결제 ----------
@@ -110,8 +128,9 @@ def show_flash():
 def pay_dialog(cat: str):
     ctx, u = st.session_state["ctx"], user()
     icon, label = CATS[cat]
-    amount = price()
-    st.markdown(f"**{icon} {label}** 전체 풀이 · **{won(amount)}** (1건)")
+    amount = price_for(cat)
+    okey = fortune.order_key(ctx["key"], cat)
+    st.markdown(f"**{icon} {label}** · {ch.PERSONAS[cat]['name']}의 풀이 · **{won(amount)}** (1건)")
     if not u:
         st.caption("비회원으로 결제합니다. 결제 후 화면에 표시되는 **주문 열람 링크**를 저장해 두시면 풀이를 다시 볼 수 있어요.")
     if payments.mode() == "mock":
@@ -127,7 +146,7 @@ def pay_dialog(cat: str):
     def new_order():
         uid = u["id"] if u else db.create_guest_user()
         payload = json.dumps({**ctx["params"], "name": ctx["name"]}, ensure_ascii=False)
-        return db.create_pending_order(uid, ctx["key"], cat, ctx["summary"], amount, payload)
+        return db.create_pending_order(uid, okey, cat, ctx["summary"], amount, payload)
 
     if payments.mode() == "mock":
         if st.button("결제하기", type="primary", disabled=not agree, width="stretch"):
@@ -135,9 +154,7 @@ def pay_dialog(cat: str):
                 order_no, token = new_order()
                 ok, tx, provider = payments.charge(u or {}, amount, f"{label} 풀이")
                 if ok:
-                    content = itp.generate_full(
-                        ctx["chart"], cat, ctx["name"], use_llm=db.get_setting("use_llm", "0") == "1"
-                    )
+                    content = fortune.full_content(ctx["chart"], cat, ctx["name"])
                     db.complete_order(order_no, tx, provider, content)
                     o = db.get_order_by_no(order_no)
                     db.log_event("paid", o["user_id"] if u else None, cat)
@@ -150,7 +167,7 @@ def pay_dialog(cat: str):
     if not base:
         st.error("서비스 주소(PUBLIC_URL)가 설정되지 않아 결제를 진행할 수 없습니다. 운영자에게 문의해 주세요.")
         return
-    key = f"pay_url_{ctx['key']}_{cat}"
+    key = f"pay_url_{okey}_{cat}"
     if st.button("결제 진행하기", type="primary", disabled=not agree, width="stretch"):
         order_no, token = new_order()
         params = {
@@ -176,7 +193,7 @@ def guest_result_block():
     icon, label = CATS.get(o["category"], ("", o["category"]))
     st.success(f"{icon} {label} 풀이가 열렸어요. (주문번호 {o['order_no']})")
     with st.expander("📖 전체 풀이 보기", expanded=True):
-        st.markdown(o["content"])
+        render_content(o["category"], o["content"])
     base = public_url()
     if base:
         st.markdown("**🔗 주문 열람 링크** — 저장해 두면 언제든 이 풀이를 다시 볼 수 있어요. (타인에게 공유하지 마세요)")
@@ -245,7 +262,7 @@ def handle_payment_return():
     try:
         p = json.loads(order["payload"] or "{}")
         chart = se.compute_chart(p["y"], p["m"], p["d"], p["hour"], p["minute"], p["gender"], p["calendar"], p["leap"], p["adj"])
-        content = itp.generate_full(chart, order["category"], p.get("name", ""), use_llm=db.get_setting("use_llm", "0") == "1")
+        content = fortune.full_content(chart, order["category"], p.get("name", ""))
     except Exception:
         logging.getLogger("saju.pay").exception("content generation failed for %s", order_no)
         content = "풀이 생성 중 문제가 발생했습니다. 고객센터에 주문번호 " + order_no + " 로 문의해 주세요."
@@ -261,48 +278,102 @@ def handle_payment_return():
 
 
 # ---------- 홈 ----------
-def category_block(ctx, cat):
+def pick_cards():
+    st.markdown('<div id="pick"></div>', unsafe_allow_html=True)
+    st.subheader("어떤 운을 보고 싶으신가요?")
+    st.caption("보고 싶은 운세를 고르면, 그 일에 밝은 인물이 대화하듯 풀이해 드려요. 요약은 무료입니다.")
+    cats = enabled_cats()
+    for i in range(0, len(cats), 2):
+        cols = st.columns(2)
+        for col, cat in zip(cols, cats[i:i + 2]):
+            p = ch.PERSONAS[cat]
+            with col.container(border=True):
+                st.markdown(
+                    ch.portrait_html(cat, "4 / 3")
+                    + f'<div class="pname">{CATS[cat][1]}</div><div class="ptitle">{p["name"]} · {p["title"]}</div>'
+                    + f'<div class="ptag">{p["tagline"]}</div><span class="price">{won(price_for(cat))}</span> <span class="ptitle">요약 무료</span>',
+                    unsafe_allow_html=True)
+                if st.button("이분께 묻기  →", key=f"pick_{cat}", type="primary", width="stretch"):
+                    st.session_state["cat_sel"] = cat
+                    st.session_state["pill_cat"] = cat
+                    st.rerun()
+
+
+def fortune_view(ctx, cat):
+    p = ch.PERSONAS[cat]
     icon, label = CATS[cat]
-    pv = itp.preview(ctx["chart"], cat)
     u = user()
-    st.subheader(f"{icon} {label}")
-    st.markdown(f"**{pv['head']}**")
-    st.write(pv["teaser"] + " …")
-
-    order = db.find_order(u["id"], ctx["key"], cat) if u else None
+    okey = fortune.order_key(ctx["key"], cat)
+    st.subheader(f"{icon} {label} · {p['name']}")
+    if cat in fortune.DAILY:
+        st.caption(f"{fortune.today_kst().strftime('%Y년 %m월 %d일')} 하루의 운세예요. 오늘은 다시 볼 수 있고, 내일은 새로 풀이합니다.")
+    order = db.find_order(u["id"], okey, cat) if u else None
     if order:
-        with st.expander("📖 전체 풀이 보기", expanded=True):
-            st.markdown(order["content"])
+        render_content(cat, order["content"])
         return
-
+    msgs = fortune.preview_messages(ctx["chart"], cat, ctx["name"])
+    st.markdown(fortune.bubbles_html(cat, msgs), unsafe_allow_html=True)
     with st.container(border=True):
-        st.markdown("🔒 **전체 풀이에 포함된 내용**")
-        st.markdown(" · ".join(itp.LOCKED_TITLES))
-        if st.button(f"🔓 {won(price())} 결제하고 전체 보기", key=f"pay_{cat}", type="primary", width="stretch"):
+        st.markdown("🔒 **이어서 들려주실 이야기**")
+        st.markdown(" · ".join(fortune.LOCKED[cat]))
+        if st.button(f"🔓 {won(price_for(cat))} 결제하고 이어서 듣기", key=f"pay_{cat}", type="primary", width="stretch"):
             db.log_event("pay_open", (u or {}).get("id"), cat)
             pay_dialog(cat)
         if not u:
-            st.caption("회원가입 없이 카드로 바로 결제할 수 있어요. 회원이면 구매내역에서 풀이를 언제든 다시 볼 수 있습니다.")
+            st.caption("회원가입 없이 카드로 바로 결제할 수 있어요. 회원이면 구매내역에서 풀이를 다시 볼 수 있습니다.")
 
 
 def home():
     show_flash()
     guest_result_block()
-    st.title(f"🔮 {service_name()}")
-    st.caption("생년월일시로 보는 직업운 · 재물운 · 연애운 — 요약은 누구나 무료, 상세 풀이는 건당 결제")
+    st.markdown(theme.hero_html(service_name()) + theme.FEATURES, unsafe_allow_html=True)
 
-    with st.form("birth"):
-        name = st.text_input("이름 (선택)", max_chars=20)
-        c1, c2 = st.columns(2)
-        gender = c1.radio("성별", ["여성", "남성"], horizontal=True)
-        cal = c2.radio("달력", ["양력", "음력"], horizontal=True)
-        bd = st.date_input("생년월일", value=date(1995, 1, 1), min_value=date(1920, 1, 1),
-                           max_value=date.today(), format="YYYY/MM/DD")
-        leap = st.checkbox("음력 윤달")
-        unknown = st.checkbox("태어난 시간을 몰라요")
-        bt = st.time_input("태어난 시간", value=time(12, 0), step=60)
-        adj = st.checkbox("진태양시 보정 (-30분)")
-        go = st.form_submit_button("내 사주 보기", type="primary", width="stretch")
+    cats = enabled_cats()
+    sel = st.session_state.get("cat_sel")
+    if sel not in cats:
+        sel = None
+
+    if not sel:
+        pick_cards()
+        with st.container(border=True):
+            st.markdown('<span class="parch"></span><div style="font-size:12px">오늘의 운세</div>'
+                        '<div style="font-size:21px;font-weight:700;margin:4px 0">지금, 당신의 하늘은<br>어떤 메시지를 전하고 있나요?</div>'
+                        '<div style="font-size:13px">집현전 학사가 전하는 오늘 하루의 출근길 기운을 확인해 보세요.</div>',
+                        unsafe_allow_html=True)
+            if "commute" in cats and st.button("오늘의 운세 보기  →", key="today_btn"):
+                st.session_state["cat_sel"] = "commute"
+                st.session_state["pill_cat"] = "commute"
+                st.rerun()
+        st.caption(itp.DISCLAIMER)
+        return
+
+    st.markdown('<div id="pick"></div>', unsafe_allow_html=True)
+    st.session_state.setdefault("pill_cat", sel)
+    choice = st.pills("운세 고르기", cats, format_func=lambda k: f"{CATS[k][0]} {CATS[k][1]}",
+                      selection_mode="single", key="pill_cat", label_visibility="collapsed")
+    if choice and choice != sel:
+        st.session_state["cat_sel"] = choice
+        st.rerun()
+    p = ch.PERSONAS[sel]
+    c1, c2 = st.columns([1, 6])
+    c1.markdown(ch.avatar_html(sel, 64), unsafe_allow_html=True)
+    c2.markdown(f'<div class="pname" style="margin-top:0">{p["name"]}</div><div class="ptitle">{p["title"]}</div>'
+                f'<div class="ptag">{p["tagline"]}</div>', unsafe_allow_html=True)
+
+    ctx = st.session_state.get("ctx")
+    with st.expander("생년월일 입력" if not ctx else "생년월일 다시 입력", expanded=not ctx):
+        with st.form("birth"):
+            name = st.text_input("이름 (선택)", max_chars=20)
+            c1, c2 = st.columns(2)
+            gender = c1.radio("성별", ["여성", "남성"], horizontal=True)
+            cal = c2.radio("달력", ["양력", "음력"], horizontal=True)
+            bd = st.date_input("생년월일", value=date(1995, 1, 1), min_value=date(1920, 1, 1),
+                               max_value=date.today(), format="YYYY/MM/DD")
+            leap = st.checkbox("음력 윤달")
+            unknown = st.checkbox("태어난 시간을 몰라요")
+            bt = st.time_input("태어난 시간", value=time(12, 0), step=60)
+            adj = st.checkbox("진태양시 보정 (-30분)")
+            go = st.form_submit_button("내 사주 보기", type="primary", width="stretch")
 
     if go:
         hour, minute = (None, 0) if unknown else (bt.hour, bt.minute)
@@ -313,7 +384,7 @@ def home():
             chart = None
         if chart:
             tstr = "시간미상" if unknown else f"{bt.hour:02d}:{bt.minute:02d}"
-            st.session_state["ctx"] = {
+            ctx = st.session_state["ctx"] = {
                 "chart": chart, "name": name.strip(),
                 "key": se.chart_key(bd.year, bd.month, bd.day, hour, minute, gender, cal, leap, adj),
                 "summary": f"{bd.isoformat()} {tstr} {cal} {gender}",
@@ -321,26 +392,20 @@ def home():
                            "gender": gender, "calendar": cal, "leap": leap, "adj": adj},
             }
             db.log_event("chart", (user() or {}).get("id"))
+            st.rerun()
 
-    ctx = st.session_state.get("ctx")
     if not ctx:
+        st.caption(itp.DISCLAIMER)
         return
     chart = ctx["chart"]
-
+    with st.expander("내 사주 명식 보기"):
+        st.caption(f"양력 환산 {chart['solar']} · 일간 {chart['day_master']['ko']}({chart['day_master']['zh']}, {chart['day_master']['el']}) · {chart['strength']}")
+        cols = st.columns(4)
+        for col, pil, lab in zip(cols, chart["pillars"], se.LABELS):
+            col.markdown(pillar_html(lab, pil), unsafe_allow_html=True)
+        st.bar_chart(pd.DataFrame({"개수": chart["el_count"]}), height=180)
     st.divider()
-    st.subheader(f"{ctx['name'] + '님의 ' if ctx['name'] else ''}사주 명식")
-    st.caption(f"양력 환산 {chart['solar']} · 일간 {chart['day_master']['ko']}({chart['day_master']['zh']}, {chart['day_master']['el']}) · {chart['strength']}")
-    cols = st.columns(4)
-    for col, p, lab in zip(cols, chart["pillars"], se.LABELS):
-        col.markdown(pillar_html(lab, p), unsafe_allow_html=True)
-
-    st.markdown("**오행 분포**")
-    st.bar_chart(pd.DataFrame({"개수": chart["el_count"]}), height=180)
-    st.divider()
-
-    for cat in enabled_cats():
-        category_block(ctx, cat)
-        st.divider()
+    fortune_view(ctx, sel)
     st.caption(itp.DISCLAIMER)
 
 
@@ -514,7 +579,7 @@ def mypage():
             badge = "" if o["status"] == "paid" else " (환불됨)"
             with st.expander(f"{icon} {label} · {o['birth_summary']} · {won(o['amount'])} · {o['created_at']}{badge}"):
                 if o["status"] == "paid":
-                    st.markdown(o["content"])
+                    render_content(o["category"], o["content"])
                 else:
                     st.caption("환불 처리된 주문입니다.")
 
@@ -670,7 +735,7 @@ def admin_page():
 
     with t_set:
         with st.form("settings"):
-            new_price = st.number_input("건당 가격 (원)", min_value=0, step=100, value=price())
+            new_prices = {c: st.number_input(f"{CATS[c][1]} 가격 (원)", min_value=0, step=100, value=price_for(c), key=f"pr_{c}") for c in CATS}
             new_name = st.text_input("서비스 이름", value=service_name())
             cats_on = st.multiselect("노출할 운세 카테고리", list(CATS), default=enabled_cats(),
                                      format_func=lambda k: CATS[k][1])
@@ -678,9 +743,10 @@ def admin_page():
             llm = st.toggle("LLM(Claude) 풀이 사용", value=db.get_setting("use_llm", "0") == "1", disabled=not has_key,
                             help="환경변수 ANTHROPIC_API_KEY가 설정되어야 사용할 수 있습니다. 실패 시 기본 풀이로 대체됩니다.")
             if st.form_submit_button("저장", type="primary"):
-                db.set_setting("price", str(int(new_price)))
+                for c, v in new_prices.items():
+                    db.set_setting(f"price_{c}", str(int(v)))
                 db.set_setting("service_name", new_name.strip() or "AI 사주")
-                db.set_setting("enabled_cats", json.dumps(cats_on))
+                db.set_setting("enabled_cats_v2", json.dumps(cats_on))
                 db.set_setting("use_llm", "1" if (llm and has_key) else "0")
                 st.success("저장했습니다.")
         st.markdown("**사업자 정보** (결제사 심사·전자상거래법상 사이트 하단에 표시)")

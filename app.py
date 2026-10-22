@@ -30,7 +30,7 @@ def _init_db():
 
 _init_db()
 
-APP_VERSION = "0.6.3"
+APP_VERSION = "0.6.4"
 CATS = itp.CATEGORIES
 PAGES: dict = {}
 
@@ -278,6 +278,18 @@ def handle_payment_return():
 
 
 # ---------- 홈 ----------
+def load_profile(uid: int):
+    """내 정보 불러오기. DB에 저장 칸이 아직 없으면 추가한 뒤 다시 시도하고, 그래도 안 되면 None."""
+    try:
+        return db.get_profile(uid)
+    except Exception:
+        try:
+            db.execute("ALTER TABLE users ADD COLUMN profile TEXT")
+            return db.get_profile(uid)
+        except Exception:
+            return None
+
+
 def build_ctx(p: dict) -> dict:
     """입력(또는 저장된 내 정보)으로 사주 계산 결과(ctx)를 만듭니다."""
     hour, minute = (None, 0) if p["unknown"] else (p["hh"], p["mm"])
@@ -365,7 +377,7 @@ def home():
                 f'<div class="ptag">{p["tagline"]}</div>', unsafe_allow_html=True)
 
     me = user()
-    prof = db.get_profile(me["id"]) if me and me.get("role") != "guest" else None
+    prof = load_profile(me["id"]) if me and me.get("role") != "guest" else None
     ctx = st.session_state.get("ctx")
     if prof:  # 회원: 내 정보를 자동 적용
         try:
@@ -586,7 +598,7 @@ def mypage():
 
     with t_info:
         st.caption("이름과 생년월일을 저장해 두면 모든 운세에 자동으로 적용돼요. (본인 정보는 풀이에만 쓰입니다)")
-        pf = db.get_profile(u["id"]) or {}
+        pf = load_profile(u["id"]) or {}
         with st.form("profile_form"):
             p_name = st.text_input("이름", value=pf.get("name", ""), max_chars=20)
             c1, c2 = st.columns(2)
@@ -607,6 +619,7 @@ def mypage():
             else:
                 try:
                     build_ctx(newp)  # 날짜 확인
+                    load_profile(u["id"])  # 저장 칸이 없으면 먼저 추가
                     db.set_profile(u["id"], newp)
                     st.session_state.pop("ctx", None)
                     st.success("저장했어요. 이제 각 운세에 자동으로 적용됩니다.")

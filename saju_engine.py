@@ -120,3 +120,14 @@ def compute_chart(y, m, d, hour=None, minute=0, gender="여성", calendar="양�
         "year_luck": year_luck, "spouse_group": spouse_group, "spouse_count": counts[spouse_group],
         "gender": gender,
     }
+
+
+def today_info(dm_ko: str, d: date | None = None) -> dict:
+    """오늘(또는 d)의 일진(日辰)과 일간(dm_ko) 기준 십성."""
+    d = d or date.today()
+    dm = STEM_KO.index(dm_ko)
+    gz = Solar.fromYmd(d.year, d.month, d.day).getLunar().getDayInGanZhi()
+    s, b = STEM_ZH.index(gz[0]), BR_ZH.index(gz[1])
+    tg = ten_god(dm, s)
+    return {"date": d.isoformat(), "gz_ko": STEM_KO[s] + BR_KO[b], "gz_zh": gz, "stem_tg": tg,
+            "group": GROUP_OF[tg], "br_tg": ten_god(dm, BR_MAIN[b])}

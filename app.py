@@ -3,12 +3,14 @@ import json
 import logging
 import os
 from datetime import date, time
+from urllib.parse import urlencode
 
 import pandas as pd
 import streamlit as st
 
 import db
 import interpret as itp
+import legal
 import mailer
 import payments
 import saju_engine as se
@@ -24,7 +26,7 @@ def _init_db():
 
 _init_db()
 
-APP_VERSION = "0.4.1"
+APP_VERSION = "0.5.1"
 CATS = itp.CATEGORIES
 PAGES: dict = {}
 
@@ -44,6 +46,16 @@ def price() -> int:
 
 def service_name() -> str:
     return db.get_setting("service_name", "AI 사주")
+
+
+def biz(key: str) -> str:
+    """사업자 정보: 관리자가 저장한 값 우선, 없으면 기본값(legal.BUSINESS_DEFAULTS)."""
+    return db.get_setting(key, "").strip() or legal.BUSINESS_DEFAULTS.get(key, "")
+
+
+def doc_text(dk: str, default: str) -> str:
+    txt = db.get_setting(f"doc_{dk}", default)
+    return txt.replace("{service}", service_name()).replace("{phone}", biz("biz_phone") or "고객센터")
 
 
 def enabled_cats() -> list:
@@ -70,30 +82,182 @@ def pillar_html(label, p) -> str:
     )
 
 
-# ---------- 결제 다이얼로그 ----------
+# ---------- 결제 ----------
+def public_url() -> str:
+    """결제 후 돌아올 서비스 주소. Secrets의 PUBLIC_URL 우선, 없으면 접속 주소로 추정."""
+    u = os.environ.get("PUBLIC_URL", "").strip().rstrip("/")
+    if u:
+        return u
+    try:
+        h = st.context.headers
+        host = h.get("Host") or h.get("host")
+        if host:
+            proto = h.get("X-Forwarded-Proto") or ("http" if host.startswith(("localhost", "127.")) else "https")
+            return f"{proto.split(',')[0].strip()}://{host}"
+    except Exception:
+        pass
+    return ""
+
+
+def show_flash():
+    flash = st.session_state.pop("flash", None)
+    if flash:
+        lvl, msg = flash if isinstance(flash, tuple) else ("success", flash)
+        getattr(st, lvl)(msg)
+
+
 @st.dialog("상세 풀이 결제")
 def pay_dialog(cat: str):
     ctx, u = st.session_state["ctx"], user()
     icon, label = CATS[cat]
     amount = price()
     st.markdown(f"**{icon} {label}** 전체 풀이 · **{won(amount)}** (1건)")
-    if payments.MODE == "mock":
+    if not u:
+        st.caption("비회원으로 결제합니다. 결제 후 화면에 표시되는 **주문 열람 링크**를 저장해 두시면 풀이를 다시 볼 수 있어요.")
+    if payments.mode() == "mock":
         st.warning("테스트 결제 모드입니다. 실제로 청구되지 않습니다.")
-    agree = st.checkbox("디지털 콘텐츠 특성상 열람 후 청약철회가 제한될 수 있음에 동의합니다.")
-    if st.button("결제하기", type="primary", disabled=not agree, width="stretch"):
-        try:
+    elif not payments.is_live():
+        st.info("결제 테스트 모드입니다(토스페이먼츠 테스트 키). 실제로 청구되지 않습니다.")
+
+    with st.container(border=True):
+        st.markdown(legal.REFUND_SUMMARY.replace("{phone}", biz("biz_phone") or "고객센터"))
+        st.caption("전체 내용은 화면 하단의 '환불정책'에서 확인하실 수 있습니다.")
+    agree = st.checkbox("위 환불 안내를 확인했으며, 디지털 콘텐츠 제공 개시 후 청약철회가 제한됨에 동의합니다.")
+
+    def new_order():
+        uid = u["id"] if u else db.create_guest_user()
+        payload = json.dumps({**ctx["params"], "name": ctx["name"]}, ensure_ascii=False)
+        return db.create_pending_order(uid, ctx["key"], cat, ctx["summary"], amount, payload)
+
+    if payments.mode() == "mock":
+        if st.button("결제하기", type="primary", disabled=not agree, width="stretch"):
             with st.spinner("결제 및 풀이 생성 중..."):
-                ok, tx, provider = payments.charge(u, amount, f"{label} 풀이")
+                order_no, token = new_order()
+                ok, tx, provider = payments.charge(u or {}, amount, f"{label} 풀이")
                 if ok:
                     content = itp.generate_full(
                         ctx["chart"], cat, ctx["name"], use_llm=db.get_setting("use_llm", "0") == "1"
                     )
-                    db.create_order(u["id"], ctx["key"], cat, ctx["summary"], amount, provider, tx, content)
-                    db.log_event("paid", u["id"], cat)
-        except NotImplementedError as e:
-            st.error(str(e))
-            return
-        st.rerun()
+                    db.complete_order(order_no, tx, provider, content)
+                    o = db.get_order_by_no(order_no)
+                    db.log_event("paid", o["user_id"] if u else None, cat)
+                    if not u:
+                        st.session_state["guest_view"] = {"no": order_no, "t": token}
+            st.rerun()
+        return
+
+    base = public_url()
+    if not base:
+        st.error("서비스 주소(PUBLIC_URL)가 설정되지 않아 결제를 진행할 수 없습니다. 운영자에게 문의해 주세요.")
+        return
+    key = f"pay_url_{ctx['key']}_{cat}"
+    if st.button("결제 진행하기", type="primary", disabled=not agree, width="stretch"):
+        order_no, token = new_order()
+        params = {
+            "ck": payments.client_key(), "orderId": order_no, "amount": amount, "orderName": f"{label} 풀이",
+            "successUrl": f"{base}/?pay=success&t={token}", "failUrl": f"{base}/?pay=fail",
+        }
+        if u:
+            params.update({"email": u["email"], "name": u["name"]})
+        st.session_state[key] = f"{base}/app/static/checkout.html?{urlencode(params)}"
+    if st.session_state.get(key):
+        st.link_button("💳 결제창 열기", st.session_state[key], type="primary", width="stretch")
+        st.caption("결제창은 새 탭에서 열립니다. 결제가 끝나면 자동으로 돌아와 풀이가 열려요.")
+
+
+def guest_result_block():
+    """비회원 결제 후(또는 열람 링크로 접속 시) 풀이를 보여줍니다."""
+    gv = st.session_state.get("guest_view")
+    if not gv:
+        return
+    o = db.get_guest_order(gv["no"], gv["t"])
+    if not o:
+        return
+    icon, label = CATS.get(o["category"], ("", o["category"]))
+    st.success(f"{icon} {label} 풀이가 열렸어요. (주문번호 {o['order_no']})")
+    with st.expander("📖 전체 풀이 보기", expanded=True):
+        st.markdown(o["content"])
+    base = public_url()
+    if base:
+        st.markdown("**🔗 주문 열람 링크** — 저장해 두면 언제든 이 풀이를 다시 볼 수 있어요. (타인에게 공유하지 마세요)")
+        st.code(f"{base}/?view={o['order_no']}&t={gv['t']}", language=None)
+    st.caption(f"환불·문의는 주문번호를 알려 주세요. 고객센터 {biz('biz_phone') or ''}")
+    st.divider()
+
+
+def handle_payment_return():
+    """토스페이먼츠 결제 후 돌아온 요청 처리: 금액 검증 → 서버 승인 → 풀이 생성 → 주문 완료."""
+    qp = st.query_params
+    if qp.get("view"):  # 비회원 주문 열람 링크
+        st.session_state["guest_view"] = {"no": qp.get("view", ""), "t": qp.get("t", "")}
+        st.query_params.clear()
+        return
+    kind = qp.get("pay")
+    if kind not in ("success", "fail"):
+        return
+    order_no = qp.get("orderId", "")
+    params = dict(qp)
+    st.query_params.clear()
+
+    def done(level, msg, goto=False):
+        st.session_state["flash"] = (level, msg)
+        if goto:
+            st.session_state["goto_my"] = True
+
+    order = db.get_order_by_no(order_no)
+    if not order:
+        return done("error", "주문 정보를 찾을 수 없습니다. 문제가 계속되면 고객센터로 문의해 주세요.")
+
+    # 결제 후 돌아온 브라우저를 일회성 토큰으로 본인 확인 → 로그인 복원
+    uid = db.consume_return_token(order_no, params.get("t", ""))
+    if uid and not user():
+        restored = db.get_active_user(uid)
+        if restored:
+            st.session_state["user"] = restored
+
+    if kind == "fail":
+        db.fail_order(order_no)
+        return done("error", f"결제가 완료되지 않았습니다. {params.get('message', '')} (청구되지 않았습니다.)")
+
+    guest = db.is_guest_user(order["user_id"])
+    if order["status"] == "paid":
+        if guest:
+            st.session_state["guest_view"] = {"no": order_no, "t": params.get("t", "")}
+            return done("success", "이미 처리된 결제입니다. 아래에서 풀이를 확인하세요.")
+        return done("success", "이미 처리된 결제입니다. 마이페이지에서 풀이를 확인하세요.", goto=True)
+    if order["status"] != "pending":
+        return done("error", "처리할 수 없는 주문입니다. 고객센터로 문의해 주세요.")
+    try:
+        amount = int(params.get("amount", "0"))
+    except ValueError:
+        amount = 0
+    if amount != order["amount"]:  # 금액 위·변조 방지: 서버에 저장된 금액과 다르면 승인하지 않음
+        db.fail_order(order_no)
+        return done("error", "결제 금액이 주문과 일치하지 않아 승인하지 않았습니다. 청구되지 않습니다.")
+    try:
+        data = payments.confirm(params.get("paymentKey", ""), order_no, order["amount"])
+    except payments.PaymentError as e:
+        if e.code == "NETWORK":  # 승인 여부가 불확실 → 실패 처리하지 않고 대기 유지
+            return done("warning", f"결제 확인 중 통신 오류가 발생했습니다. 풀이가 열리지 않으면 주문번호 {order_no} 로 문의해 주세요.")
+        db.fail_order(order_no)
+        return done("error", f"결제 승인에 실패했습니다. ({e.code}) {e.message}")
+
+    try:
+        p = json.loads(order["payload"] or "{}")
+        chart = se.compute_chart(p["y"], p["m"], p["d"], p["hour"], p["minute"], p["gender"], p["calendar"], p["leap"], p["adj"])
+        content = itp.generate_full(chart, order["category"], p.get("name", ""), use_llm=db.get_setting("use_llm", "0") == "1")
+    except Exception:
+        logging.getLogger("saju.pay").exception("content generation failed for %s", order_no)
+        content = "풀이 생성 중 문제가 발생했습니다. 고객센터에 주문번호 " + order_no + " 로 문의해 주세요."
+    db.complete_order(order_no, data["paymentKey"], "toss", content)
+    db.log_event("paid", None if guest else order["user_id"], order["category"])
+    if guest:
+        st.session_state["guest_view"] = {"no": order_no, "t": params.get("t", "")}
+        done("success", "결제가 완료되었습니다! 아래에서 풀이를 확인하세요.")
+    elif user():
+        done("success", "결제가 완료되었습니다! 아래에서 풀이를 확인하세요.", goto=True)
+    else:
+        done("success", "결제가 완료되었습니다! 로그인하면 마이페이지에서 풀이를 볼 수 있어요.")
 
 
 # ---------- 홈 ----------
@@ -114,23 +278,18 @@ def category_block(ctx, cat):
     with st.container(border=True):
         st.markdown("🔒 **전체 풀이에 포함된 내용**")
         st.markdown(" · ".join(itp.LOCKED_TITLES))
+        if st.button(f"🔓 {won(price())} 결제하고 전체 보기", key=f"pay_{cat}", type="primary", width="stretch"):
+            db.log_event("pay_open", (u or {}).get("id"), cat)
+            pay_dialog(cat)
         if not u:
-            st.caption("상세 풀이는 회원만 이용할 수 있어요.")
-            if st.button("회원가입 / 로그인하고 열어보기", key=f"login_{cat}", width="stretch"):
-                st.switch_page(PAGES["auth"])
-        else:
-            if st.button(f"🔓 {won(price())} 결제하고 전체 보기", key=f"pay_{cat}", type="primary",
-                         width="stretch"):
-                db.log_event("pay_open", u["id"], cat)
-                pay_dialog(cat)
+            st.caption("회원가입 없이 카드로 바로 결제할 수 있어요. 회원이면 구매내역에서 풀이를 언제든 다시 볼 수 있습니다.")
 
 
 def home():
-    flash = st.session_state.pop("flash", None)
-    if flash:
-        st.success(flash)
+    show_flash()
+    guest_result_block()
     st.title(f"🔮 {service_name()}")
-    st.caption("생년월일시로 보는 직업운 · 재물운 · 연애운 — 요약은 누구나 무료, 상세 풀이는 회원 전용")
+    st.caption("생년월일시로 보는 직업운 · 재물운 · 연애운 — 요약은 누구나 무료, 상세 풀이는 건당 결제")
 
     with st.form("birth"):
         name = st.text_input("이름 (선택)", max_chars=20)
@@ -158,6 +317,8 @@ def home():
                 "chart": chart, "name": name.strip(),
                 "key": se.chart_key(bd.year, bd.month, bd.day, hour, minute, gender, cal, leap, adj),
                 "summary": f"{bd.isoformat()} {tstr} {cal} {gender}",
+                "params": {"y": bd.year, "m": bd.month, "d": bd.day, "hour": hour, "minute": minute,
+                           "gender": gender, "calendar": cal, "leap": leap, "adj": adj},
             }
             db.log_event("chart", (user() or {}).get("id"))
 
@@ -341,10 +502,11 @@ def auth_page():
 def mypage():
     u = user()
     st.title("👤 마이페이지")
+    show_flash()
     t_orders, t_id, t_pw, t_out = st.tabs(["구매내역", "아이디", "비밀번호", "회원탈퇴"])
 
     with t_orders:
-        orders = db.user_orders(u["id"])
+        orders = [o for o in db.user_orders(u["id"]) if o["status"] in ("paid", "refunded")]
         if not orders:
             st.info("아직 구매한 풀이가 없어요. 사주 보기에서 시작해 보세요.")
         for o in orders:
@@ -424,6 +586,12 @@ def admin_page():
     if not db.is_pg():
         st.warning("현재 임시 파일 DB(SQLite)를 사용 중입니다. 클라우드에서는 앱이 재시작되면 회원·주문 데이터가 사라질 수 있어요. "
                    "Secrets에 DATABASE_URL을 설정하세요. (내 컴퓨터 테스트 중이라면 무시해도 됩니다.)")
+    if payments.is_live():
+        st.success("현재 **실결제 모드**입니다. 고객 결제가 실제로 청구됩니다.")
+    elif payments.mode() == "mock":
+        st.info("현재 결제는 **테스트(mock)** 입니다. 고객에게 청구되지 않습니다. 토스페이먼츠 키를 설정하면 실제 결제 연동이 시작됩니다.")
+    else:
+        st.info("현재 토스페이먼츠 **테스트 키**로 동작 중입니다. 실제 청구는 없습니다. 계약 후 live 키로 바꾸면 실결제가 됩니다.")
     if not mailer.configured():
         st.warning("이메일 발송(SMTP)이 설정되지 않아 인증코드를 보낼 수 없습니다. Secrets에 SMTP_* 값을 설정하세요.")
     if db.authenticate(*db.DEFAULT_ADMIN):
@@ -474,8 +642,8 @@ def admin_page():
                         db.set_order_status(int(oid), "refunded")
                         st.success(f"주문 #{oid} 환불 처리 완료")
                         st.rerun()
-                except NotImplementedError as e:
-                    st.error(str(e))
+                except (NotImplementedError, payments.PaymentError) as e:
+                    st.error(f"환불 실패: {e}")
 
     with t_users:
         st.dataframe(users, width="stretch", hide_index=True)
@@ -515,10 +683,29 @@ def admin_page():
                 db.set_setting("enabled_cats", json.dumps(cats_on))
                 db.set_setting("use_llm", "1" if (llm and has_key) else "0")
                 st.success("저장했습니다.")
+        st.markdown("**사업자 정보** (결제사 심사·전자상거래법상 사이트 하단에 표시)")
+        with st.form("biz"):
+            vals = {k: st.text_input(lab, value=biz(k)) for k, lab in legal.BUSINESS_FIELDS}
+            if st.form_submit_button("사업자 정보 저장"):
+                for k, v in vals.items():
+                    db.set_setting(k, v.strip())
+                st.success("저장했습니다.")
+        st.markdown("**약관·정책 문서** (초안입니다. 오픈 전 반드시 검토·수정하세요)")
+        for dk, (dlabel, default) in legal.DOCS.items():
+            with st.expander(dlabel):
+                with st.form(f"doc_{dk}"):
+                    txt = st.text_area("내용(마크다운)", value=db.get_setting(f"doc_{dk}", default),
+                                       height=300, label_visibility="collapsed")
+                    if st.form_submit_button(f"{dlabel} 저장"):
+                        db.set_setting(f"doc_{dk}", txt)
+                        st.success("저장했습니다.")
         st.markdown("**시스템 상태**")
         st.write(f"- 데이터 저장소: {db.backend_label()}")
         st.write(f"- 이메일 발송(SMTP): {'✅ 설정됨' if mailer.configured() else '❌ 미설정'}")
         st.write(f"- LLM 키(ANTHROPIC_API_KEY): {'✅ 설정됨' if os.environ.get('ANTHROPIC_API_KEY') else '미설정'}")
+        st.write(f"- 결제: {payments.mode_label()}")
+        if payments.mode() == "toss":
+            st.write(f"- 서비스 주소(PUBLIC_URL): {public_url() or '❌ 미설정'}")
         st.write(f"- 앱 버전: {APP_VERSION}")
         if st.button("내 이메일로 테스트 메일 보내기", disabled=not mailer.configured()):
             try:
@@ -537,14 +724,43 @@ def admin_page():
                     st.error(str(e))
 
 
+# ---------- 약관·정책 / 푸터 ----------
+def legal_page():
+    st.title("📄 약관 · 정책")
+    tabs = st.tabs([lab for lab, _ in legal.DOCS.values()])
+    for tab, (dk, (dlabel, default)) in zip(tabs, legal.DOCS.items()):
+        with tab:
+            st.markdown(doc_text(dk, default))
+    info = {k: biz(k) for k, _ in legal.BUSINESS_FIELDS}
+    if any(info.values()):
+        st.divider()
+        st.markdown("**사업자 정보**")
+        for k, lab in legal.BUSINESS_FIELDS:
+            if info[k]:
+                st.write(f"- {lab}: {info[k]}")
+
+
+def footer():
+    info = {k: biz(k) for k, _ in legal.BUSINESS_FIELDS}
+    st.divider()
+    names = dict(legal.BUSINESS_FIELDS)
+    parts = [f"{names[k]} {v}" for k, v in info.items() if v]
+    if parts:
+        st.caption(" | ".join(parts))
+    st.page_link(PAGES["legal"], label="이용약관 · 환불정책 · 개인정보처리방침", icon="📄")
+
+
 # ---------- 내비게이션 ----------
 PAGES["home"] = st.Page(home, title="사주 보기", icon="🔮", url_path="home", default=True)
 PAGES["auth"] = st.Page(auth_page, title="로그인 / 회원가입", icon="🔑", url_path="auth")
 PAGES["my"] = st.Page(mypage, title="마이페이지", icon="👤", url_path="my")
 PAGES["admin"] = st.Page(admin_page, title="관리자", icon="🛠️", url_path="admin")
+PAGES["legal"] = st.Page(legal_page, title="약관·정책", icon="📄", url_path="legal")
+
+handle_payment_return()  # 결제창에서 돌아온 경우 처리(로그인 복원 포함)
 
 u = user()
-nav = [PAGES["home"]]
+nav = [PAGES["home"], PAGES["legal"]]
 if u:
     nav.append(PAGES["my"])
     if u["role"] == "admin":
@@ -553,6 +769,8 @@ else:
     nav.append(PAGES["auth"])
 
 pg = st.navigation(nav, position="hidden")  # 기본 메뉴는 숨기고 아래에서 직접 구성
+if u and st.session_state.pop("goto_my", False):
+    st.switch_page(PAGES["my"])
 
 with st.sidebar:
     st.page_link(PAGES["home"], label="사주 보기", icon="🔮", width="stretch")
@@ -569,3 +787,4 @@ with st.sidebar:
     st.caption(f"v{APP_VERSION}")
 
 pg.run()
+footer()

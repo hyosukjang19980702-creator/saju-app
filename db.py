@@ -94,7 +94,8 @@ def init_db():
           id {pk}, user_id INTEGER NOT NULL REFERENCES users(id),
           chart_key TEXT NOT NULL, category TEXT NOT NULL, birth_summary TEXT,
           amount INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'paid',
-          pg_provider TEXT, pg_tx_id TEXT, content TEXT, created_at TEXT NOT NULL)""",
+          pg_provider TEXT, pg_tx_id TEXT, content TEXT, created_at TEXT NOT NULL,
+          order_no TEXT, payload TEXT, token_hash TEXT, view_hash TEXT)""",
         "CREATE INDEX IF NOT EXISTS idx_orders_lookup ON orders(user_id, chart_key, category)",
         "CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
         f"""CREATE TABLE IF NOT EXISTS events(
@@ -113,6 +114,11 @@ def init_db():
         execute("ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 1")
     if "deleted_at" not in cols:
         execute("ALTER TABLE users ADD COLUMN deleted_at TEXT")
+    ocols = [c["name"] for c in inspect(engine()).get_columns("orders")]
+    for col in ("order_no", "payload", "token_hash", "view_hash"):
+        if col not in ocols:
+            execute(f"ALTER TABLE orders ADD COLUMN {col} TEXT")
+    execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_orderno ON orders(order_no)")
 
     admin_email = os.environ.get("ADMIN_EMAIL", "").strip().lower()
     admin_pw = os.environ.get("ADMIN_PASSWORD", "")
@@ -201,6 +207,11 @@ def get_user(uid: int):
     return _public(u) if u else None
 
 
+def get_active_user(uid: int):
+    u = query_one("SELECT * FROM users WHERE id=:i AND is_active=1 AND deleted_at IS NULL", i=uid)
+    return _public(u) if u else None
+
+
 def get_user_by_email(email: str):
     u = query_one("SELECT * FROM users WHERE email=:e", e=email.strip().lower())
     return _public(u) if u else None
@@ -258,7 +269,7 @@ def withdraw_user(uid: int, pw: str):
         raise ValueError("비밀번호가 일치하지 않습니다.")
     salt = secrets.token_hex(16)
     execute("DELETE FROM email_codes WHERE email=:e", e=u["email"])
-    execute("UPDATE orders SET birth_summary=NULL, content=NULL WHERE user_id=:i", i=uid)
+    execute("UPDATE orders SET birth_summary=NULL, content=NULL, payload=NULL, token_hash=NULL WHERE user_id=:i", i=uid)
     execute("UPDATE events SET user_id=NULL WHERE user_id=:i", i=uid)
     execute(
         "UPDATE users SET email=:a, name='탈퇴회원', pw_hash=:h, salt=:s, is_active=0, email_verified=0, deleted_at=:t WHERE id=:i",
@@ -330,6 +341,78 @@ def create_order(user_id, chart_key, category, birth_summary, amount, provider, 
     )
 
 
+def create_pending_order(user_id, chart_key, category, birth_summary, amount, payload: str):
+    """결제 전 '대기' 주문 생성. returns (주문번호, 복귀용 일회성 토큰)"""
+    order_no = "SJ" + datetime.now(KST).strftime("%y%m%d%H%M%S") + secrets.token_hex(4)
+    token = secrets.token_urlsafe(24)
+    insert_returning_id(
+        "INSERT INTO orders(user_id,chart_key,category,birth_summary,amount,status,payload,order_no,token_hash,view_hash,created_at)"
+        " VALUES(:u,:k,:c,:b,:a,'pending',:pl,:o,:th,:th,:ts)",
+        u=user_id, k=chart_key, c=category, b=birth_summary, a=amount, pl=payload, o=order_no,
+        th=hashlib.sha256(token.encode()).hexdigest(), ts=now(),
+    )
+    return order_no, token
+
+
+def create_guest_user() -> int:
+    """비회원 결제용 임시 계정 행(로그인 불가). 주문을 users 테이블과 연결하기 위한 용도."""
+    gid = secrets.token_hex(8)
+    return insert_returning_id(
+        "INSERT INTO users(email,name,pw_hash,salt,role,is_active,email_verified,created_at) "
+        "VALUES(:e,'비회원',:h,:s,'guest',0,0,:t)",
+        e=f"guest-{gid}@guest.invalid", h=secrets.token_hex(32), s=secrets.token_hex(16), t=now(),
+    )
+
+
+def is_guest_user(uid: int) -> bool:
+    u = query_one("SELECT role FROM users WHERE id=:i", i=uid)
+    return bool(u and u["role"] == "guest")
+
+
+def get_guest_order(order_no: str, token: str):
+    """비회원 주문 열람: 주문번호 + 결제 시 발급된 열람키가 맞고 결제완료일 때만 반환."""
+    o = get_order_by_no(order_no)
+    if not o or not token or not o.get("view_hash") or o["status"] != "paid":
+        return None
+    if not hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(), o["view_hash"]):
+        return None
+    if not is_guest_user(o["user_id"]):
+        return None
+    return o
+
+
+def get_order_by_no(order_no: str):
+    return query_one("SELECT * FROM orders WHERE order_no=:o", o=order_no) if order_no else None
+
+
+def consume_return_token(order_no: str, token: str):
+    """결제 후 돌아온 브라우저를 본인으로 확인하는 일회성 토큰(2시간 유효). 성공 시 user_id 반환."""
+    o = get_order_by_no(order_no)
+    if not o or not o.get("token_hash") or not token:
+        return None
+    if not hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(), o["token_hash"]):
+        return None
+    if (datetime.now(KST) - _parse(o["created_at"])).total_seconds() > 7200:
+        return None
+    execute("UPDATE orders SET token_hash=NULL WHERE id=:i", i=o["id"])
+    return o["user_id"]
+
+
+def complete_order(order_no: str, tx_id: str, provider: str, content: str) -> bool:
+    """대기 → 결제완료. 이미 처리된 주문이면 False(중복 승인 방지). 생년월일 등 임시 데이터(payload)는 삭제."""
+    with engine().begin() as c:
+        r = c.execute(
+            text("UPDATE orders SET status='paid', pg_provider=:p, pg_tx_id=:x, content=:c, payload=NULL, token_hash=NULL "
+                 "WHERE order_no=:o AND status='pending'"),
+            dict(p=provider, x=tx_id, c=content, o=order_no),
+        )
+        return r.rowcount == 1
+
+
+def fail_order(order_no: str):
+    execute("UPDATE orders SET status='failed', payload=NULL, token_hash=NULL WHERE order_no=:o AND status='pending'", o=order_no)
+
+
 def user_orders(user_id: int):
     return query("SELECT * FROM orders WHERE user_id=:u ORDER BY id DESC", u=user_id)
 
@@ -369,7 +452,7 @@ def admin_users_df() -> pd.DataFrame:
         "SELECT u.id, u.email, u.name, u.role, u.is_active, u.email_verified, u.created_at, "
         "COUNT(CASE WHEN o.status='paid' THEN 1 END) AS paid_orders, "
         "COALESCE(SUM(CASE WHEN o.status='paid' THEN o.amount END),0) AS total_paid "
-        "FROM users u LEFT JOIN orders o ON o.user_id=u.id WHERE u.deleted_at IS NULL GROUP BY u.id ORDER BY u.id DESC"
+        "FROM users u LEFT JOIN orders o ON o.user_id=u.id WHERE u.deleted_at IS NULL AND u.role<>'guest' GROUP BY u.id ORDER BY u.id DESC"
     )
 
 

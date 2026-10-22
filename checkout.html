@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>결제하기</title>
+<script src="https://js.tosspayments.com/v2/standard"></script>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,"Malgun Gothic",sans-serif;margin:0;background:#f5f6f8;color:#222}
+  .box{max-width:560px;margin:0 auto;padding:20px}
+  h2{margin:8px 0 4px} .sub{color:#666;margin:0 0 16px}
+  .card{background:#fff;border-radius:12px;padding:16px;margin-bottom:12px}
+  button{width:100%;padding:14px;border:0;border-radius:10px;background:#3182f6;color:#fff;font-size:16px;font-weight:600;cursor:pointer}
+  button:disabled{background:#aab}
+  #msg{color:#c62828;margin-top:10px;white-space:pre-wrap}
+</style>
+</head>
+<body>
+<div class="box">
+  <h2>결제하기</h2>
+  <p class="sub" id="summary">주문 정보를 불러오는 중…</p>
+  <div class="card" id="payment-method"></div>
+  <div class="card" id="agreement"></div>
+  <button id="pay" disabled>결제하기</button>
+  <p id="msg"></p>
+</div>
+<script>
+(function () {
+  var q = new URLSearchParams(location.search);
+  var ck = q.get("ck"), orderId = q.get("orderId"), amount = parseInt(q.get("amount"), 10);
+  var orderName = q.get("orderName") || "상세 풀이";
+  var successUrl = q.get("successUrl"), failUrl = q.get("failUrl");
+  var email = q.get("email") || undefined, name = q.get("name") || undefined;
+  var btn = document.getElementById("pay"), msg = document.getElementById("msg");
+
+  function fail(t) { msg.textContent = t; }
+  if (!ck || !orderId || !amount || !successUrl || !failUrl) {
+    return fail("주문 정보가 올바르지 않습니다. 서비스 화면에서 다시 시도해 주세요.");
+  }
+  if (typeof TossPayments === "undefined") {
+    return fail("결제 모듈을 불러오지 못했습니다. 네트워크를 확인하고 새로고침해 주세요.");
+  }
+  document.getElementById("summary").textContent = orderName + " · " + amount.toLocaleString("ko-KR") + "원";
+
+  var ANON = TossPayments.ANONYMOUS || "ANONYMOUS";
+  var toss = TossPayments(ck);
+
+  function guard(fn) {
+    return function () {
+      btn.disabled = true;
+      Promise.resolve().then(fn).catch(function (e) {
+        btn.disabled = false;
+        if (e && e.code === "USER_CANCEL") { return fail("결제를 취소하셨습니다."); }
+        fail("결제창을 열지 못했습니다. (" + ((e && (e.code || e.message)) || "오류") + ")");
+      });
+    };
+  }
+
+  if (ck.indexOf("_gck_") !== -1) {
+    // 결제위젯(주문서형) 연동 키
+    var widgets = toss.widgets({ customerKey: ANON });
+    widgets.setAmount({ currency: "KRW", value: amount })
+      .then(function () {
+        return Promise.all([
+          widgets.renderPaymentMethods({ selector: "#payment-method", variantKey: "DEFAULT" }),
+          widgets.renderAgreement({ selector: "#agreement", variantKey: "AGREEMENT" })
+        ]);
+      })
+      .then(function () {
+        btn.disabled = false;
+        btn.onclick = guard(function () {
+          return widgets.requestPayment({
+            orderId: orderId, orderName: orderName, successUrl: successUrl, failUrl: failUrl,
+            customerEmail: email, customerName: name
+          });
+        });
+      })
+      .catch(function (e) { fail("결제 화면을 준비하지 못했습니다. (" + ((e && (e.code || e.message)) || "오류") + ")"); });
+  } else {
+    // 결제창(API 개별 연동 키): 카드·간편결제
+    document.getElementById("payment-method").style.display = "none";
+    document.getElementById("agreement").style.display = "none";
+    btn.disabled = false;
+    btn.onclick = guard(function () {
+      return toss.payment({ customerKey: ANON }).requestPayment({
+        method: "CARD", amount: { currency: "KRW", value: amount },
+        orderId: orderId, orderName: orderName, successUrl: successUrl, failUrl: failUrl,
+        customerEmail: email, customerName: name
+      });
+    });
+  }
+})();
+</script>
+</body>
+</html>

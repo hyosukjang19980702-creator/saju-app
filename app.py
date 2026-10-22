@@ -30,7 +30,7 @@ def _init_db():
 
 _init_db()
 
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.6.1"
 CATS = itp.CATEGORIES
 PAGES: dict = {}
 
@@ -295,7 +295,6 @@ def pick_cards():
                     unsafe_allow_html=True)
                 if st.button("이분께 묻기  →", key=f"pick_{cat}", type="primary", width="stretch"):
                     st.session_state["cat_sel"] = cat
-                    st.session_state["pill_cat"] = cat
                     st.rerun()
 
 
@@ -326,33 +325,19 @@ def fortune_view(ctx, cat):
 def home():
     show_flash()
     guest_result_block()
-    st.markdown(theme.hero_html(service_name()) + theme.FEATURES, unsafe_allow_html=True)
-
     cats = enabled_cats()
     sel = st.session_state.get("cat_sel")
     if sel not in cats:
         sel = None
 
     if not sel:
+        st.markdown(theme.hero_html(service_name()), unsafe_allow_html=True)
         pick_cards()
-        with st.container(border=True):
-            st.markdown('<span class="parch"></span><div style="font-size:12px">오늘의 운세</div>'
-                        '<div style="font-size:21px;font-weight:700;margin:4px 0">지금, 당신의 하늘은<br>어떤 메시지를 전하고 있나요?</div>'
-                        '<div style="font-size:13px">집현전 학사가 전하는 오늘 하루의 출근길 기운을 확인해 보세요.</div>',
-                        unsafe_allow_html=True)
-            if "commute" in cats and st.button("오늘의 운세 보기  →", key="today_btn"):
-                st.session_state["cat_sel"] = "commute"
-                st.session_state["pill_cat"] = "commute"
-                st.rerun()
         st.caption(itp.DISCLAIMER)
         return
 
-    st.markdown('<div id="pick"></div>', unsafe_allow_html=True)
-    st.session_state.setdefault("pill_cat", sel)
-    choice = st.pills("운세 고르기", cats, format_func=lambda k: f"{CATS[k][0]} {CATS[k][1]}",
-                      selection_mode="single", key="pill_cat", label_visibility="collapsed")
-    if choice and choice != sel:
-        st.session_state["cat_sel"] = choice
+    if st.button("← 다른 운세 고르기", key="back_main"):
+        st.session_state["cat_sel"] = None
         st.rerun()
     p = ch.PERSONAS[sel]
     c1, c2 = st.columns([1, 6])
@@ -839,7 +824,9 @@ if u and st.session_state.pop("goto_my", False):
     st.switch_page(PAGES["my"])
 
 with st.sidebar:
-    st.page_link(PAGES["home"], label="사주 보기", icon="🔮", width="stretch")
+    if st.button("🔮 사주 보기", key="side_home", width="stretch"):
+        st.session_state["cat_sel"] = None  # 운세 선택 화면(메인)으로
+        st.switch_page(PAGES["home"])
     if not u:
         st.page_link(PAGES["auth"], label="로그인 / 회원가입", icon="🔑", width="stretch")
     elif u["role"] == "admin":
